@@ -1,6 +1,8 @@
 use alloc::vec::Vec;
 use log::warn;
 use sha2::{Digest, Sha256};
+use uefi::proto::network::IpAddress;
+use uefi::proto::network::pxe::{BaseCode, DhcpV4Packet};
 use uefi::{prelude::*, proto::loaded_image::LoadedImage, CStr16, CString16, Result};
 
 use crate::common::{boot_linux_unchecked, extract_string};
@@ -120,8 +122,8 @@ pub fn boot_linux(handle: Handle, mut system_table: SystemTable<Boot>) -> Status
         .expect("Failed to extract configuration from binary. Did you run lzbt?")
     };
 
-    let kernel_data;
-    let initrd_data;
+    let mut kernel_data;
+    let mut initrd_data;
 
     {
         let mut file_system = system_table
@@ -129,12 +131,57 @@ pub fn boot_linux(handle: Handle, mut system_table: SystemTable<Boot>) -> Status
             .get_image_file_system(handle)
             .expect("Failed to get file system handle");
 
-        kernel_data = file_system
-            .read(&*config.kernel_filename)
-            .expect("Failed to read kernel file into memory");
-        initrd_data = file_system
-            .read(&*config.initrd_filename)
-            .expect("Failed to read initrd file into memory");
+        if system_table.boot_services().test_protocol::<uefi::proto::media::fs::SimpleFileSystem>(filesystem_protocol_params).is_ok() {
+            let mut file_system = system_table
+                .boot_services()
+                .get_image_file_system(handle)
+                .expect("Failed to get file system handle");
+
+            kernel_data = file_system
+                .read(&*config.kernel_filename)
+                .expect("Failed to read kernel file into memory");
+            initrd_data = file_system
+                .read(&*config.initrd_filename)
+                .expect("Failed to read initrd file into memory");
+        } else {
+            let loaded_image_protocol = system_table.boot_services().open_protocol_exclusive::<LoadedImage>(system_table.boot_services().image_handle())
+                .expect("Failed to open the loaded image protocol on the currently loaded image");
+
+            let mut base_code = system_table.boot_services().open_protocol_exclusive::<BaseCode>(loaded_image_protocol.device()).unwrap();
+
+            assert!(base_code.mode().dhcp_ack_received);
+            let dhcp_ack: &DhcpV4Packet = base_code.mode().dhcp_ack.as_ref();
+            let server_ip = dhcp_ack.bootp_si_addr;
+            let server_ip = IpAddress::new_v4(server_ip);
+
+            let kernel_filename = cstr8!("./bzImage");
+            let initrd_filename = cstr8!("./initrd");
+
+            let kfile_size = base_code
+                .tftp_get_file_size(&server_ip, kernel_filename)
+                .expect("failed to query file size");
+
+            let ifile_size = base_code
+                .tftp_get_file_size(&server_ip, initrd_filename)
+                .expect("failed to query file size");
+
+            assert!(kfile_size > 0);
+            assert!(ifile_size > 0);
+
+            kernel_data = Vec::with_capacity(kfile_size as usize);
+            kernel_data.resize(kfile_size as usize, 0);
+            initrd_data = Vec::with_capacity(ifile_size as usize);
+            initrd_data.resize(ifile_size as usize, 0);
+            let klen = base_code
+                .tftp_read_file(&server_ip, kernel_filename, Some(&mut kernel_data))
+                .expect("failed to read file");
+            let ilen = base_code
+                .tftp_read_file(&server_ip, initrd_filename, Some(&mut initrd_data))
+                .expect("failed to read file");
+
+            assert!(klen > 0);
+            assert!(ilen > 0);
+        }
     }
 
     let is_kernel_hash_correct = Sha256::digest(&kernel_data) == config.kernel_hash;
