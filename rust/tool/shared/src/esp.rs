@@ -22,6 +22,30 @@ pub trait EspPaths<const N: usize> {
     fn linux_path(&self) -> &Path;
 }
 
+pub struct BuildEspPaths {
+    root_path: PathBuf
+}
+
+impl EspPaths<0> for BuildEspPaths {
+    fn new(esp: impl AsRef<Path>) -> Self {
+        BuildEspPaths {
+            root_path: esp.as_ref().to_path_buf()
+        }
+    }
+
+    fn iter(&self) -> std::array::IntoIter<&PathBuf, 0> {
+        [].into_iter()
+    }
+
+    fn nixos_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    fn linux_path(&self) -> &Path {
+        &self.root_path
+    }
+}
+
 /// Paths to the boot files of a specific generation.
 pub struct EspGenerationPaths {
     pub kernel: PathBuf,
