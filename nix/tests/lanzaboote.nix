@@ -1,12 +1,47 @@
 { pkgs
 , lanzabooteModule
+, evalConfig
 }:
 
 let
   inherit (pkgs) lib system;
 
-  mkSecureBootTest = { name, machine ? { }, useSecureBoot ? true, useTPM2 ? false, readEfiVariables ? false, testScript }:
+  mkSecureBootTest = { name, machine ? { }, useSecureBoot ? true, useTPM2 ? false, readEfiVariables ? false, useNetboot ? false, testScript }:
     let
+      lanzabooteNetbootSystem = (evalConfig {
+        inherit system;
+        modules =
+          [
+            "${pkgs.path}/nixos/modules/installer/netboot/netboot.nix"
+            "${pkgs.path}/nixos/modules/testing/test-instrumentation.nix"
+            lanzabooteModule
+            ({ config, pkgs, ... }: {
+              # We refer to our own NixOS module package rather than pkgs.lzbt
+              # which does not exist in general.
+              # As the flake.nix defines the package in an ad-hoc fashion
+              # rather than using overlays which may not propagate here I guess?
+              system.build.netbootStub = pkgs.runCommand "build-netboot-stub" { } ''
+                mkdir -p $out
+                ${config.boot.lanzaboote.package}/bin/lzbt \
+                  build \
+                  --public-key ${./fixtures/uefi-keys/keys/db/db.pem} \
+                  --private-key ${./fixtures/uefi-keys/keys/db/db.key} \
+                  --initrd ${config.system.build.netbootRamdisk}/initrd \
+                  ${config.system.build.toplevel} > $out/netlanzaboote.efi
+              '';
+            })
+          ];
+      }).config.system;
+      lanzabooteNetbootTree = pkgs.symlinkJoin {
+        name = "ipxeBootDir";
+        paths = [
+          lanzabooteNetbootSystem.build.netbootRamdisk
+          lanzabooteNetbootSystem.build.kernel
+          # Lanzaboote stub for netboot purposes
+          lanzabooteNetbootSystem.build.netbootStub
+        ];
+      };
+      lanzabooteNetbootFile = "netlanzaboote.efi";
       tpmSocketPath = "/tmp/swtpm-sock";
       tpmDeviceModels = {
         x86_64-linux = "tpm-tis";
@@ -76,6 +111,10 @@ let
         def swtpm_running():
           tpm.check()
       '';
+      netbootNetworkOptions = ''
+        import os
+        os.environ['QEMU_NET_OPTS'] = ','.join(os.environ.get('QEMU_NET_OPTS', "").split(',') + ["tftp=${lanzabooteNetbootTree}", "bootfile=/${lanzabooteNetbootFile}"])
+      '';
     in
     pkgs.nixosTest {
       inherit name;
@@ -83,9 +122,9 @@ let
       testScript = ''
         ${lib.optionalString useTPM2 tpm2Initialization}
         ${lib.optionalString readEfiVariables efiVariablesHelpers}
+        ${lib.optionalString useNetboot netbootNetworkOptions}
         ${testScript}
       '';
-
 
       nodes.machine = { lib, ... }: {
         imports = [
@@ -96,13 +135,17 @@ let
         virtualisation = {
           useBootLoader = true;
           useEFIBoot = true;
+          # We want to be fully stateless when testing netboot usecases.
+          diskImage = lib.mkIf useNetboot null;
+          # Under netbooting, we override completely the networking option
+          # to point the built-in TFTP/DHCP server to the right values.
+          qemu.networkingOptions = lib.mkIf useNetboot (lib.mkForce [
+            "-net nic,netdev=user.0,model=virtio"
+            "-netdev user,id=user.0,tftp=${lanzabooteNetbootTree},bootfile=${lanzabooteNetbootFile},\${QEMU_NET_OPTS:+,$QEMU_NET_OPTS}"
+          ]);
+          memorySize = 2048;
 
-          efi.OVMF = pkgs.OVMF.override {
-            secureBoot = useSecureBoot;
-            tpmSupport = useTPM2; # This is needed otherwise OVMF won't initialize the TPM2 protocol.
-          };
-
-
+          efi.OVMF = pkgs.OVMFFull;
           qemu.options = lib.mkIf useTPM2 [
             "-chardev socket,id=chrtpm,path=${tpmSocketPath}"
             "-tpmdev emulator,id=tpm_dev_0,chardev=chrtpm"
@@ -117,6 +160,7 @@ let
         boot.loader.efi = {
           canTouchEfiVariables = true;
         };
+
         boot.lanzaboote = {
           enable = true;
           enrollKeys = lib.mkDefault true;
@@ -446,4 +490,12 @@ in
     '';
   };
 
+  netboot-basic = mkSecureBootTest {
+    name = "lanzaboote-can-netboot-prebuilt-images";
+    useNetboot = true;
+    testScript = ''
+      machine.start()
+      assert "Secure Boot: enabled (user)" in machine.succeed("bootctl status")
+    '';
+  };
 }
